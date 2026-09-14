@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 RSI Scanner - Quét RSI(14) trên 5 khung thời gian (5m/15m/1h/4h/1D)
-cho 6 mã: EUR/USD, GBP/USD, USD/JPY, Vàng, US30, US100.
+cho 12 mã: EUR/USD, GBP/USD, USD/JPY, Vàng, US30, US100, AUD/USD,
+NZD/USD, EUR/GBP, USD/CAD, EUR/JPY, AUD/JPY.
 
 Điều kiện báo (2 setup):
 
@@ -22,7 +23,9 @@ lần này mới thoả) hoặc "🔁 ĐANG TIẾP DIỄN" (đã báo từ lần
 này vẫn còn thoả). Giờ hiển thị trong tin nhắn là giờ Việt Nam (UTC+7).
 
 Có lưu trạng thái vào state.json giữa các lần chạy (dùng để theo dõi lỗi
-kéo dài), có thử lại khi Yahoo Finance lỗi tạm thời.
+kéo dài), có thử lại khi Yahoo Finance lỗi tạm thời. Có giãn cách nhẹ
+giữa các lượt gọi Yahoo Finance và giữa các lần gửi Telegram để tránh
+bị chặn/giới hạn tốc độ khi số mã theo dõi tăng lên.
 """
 
 import os
@@ -47,6 +50,12 @@ SYMBOLS = {
     "Vàng (XAU/USD)": "GC=F",
     "US30 (Dow Jones)": "YM=F",
     "US100 (Nasdaq)": "NQ=F",
+    "AUD/USD": "AUDUSD=X",
+    "NZD/USD": "NZDUSD=X",
+    "EUR/GBP": "EURGBP=X",
+    "USD/CAD": "USDCAD=X",
+    "EUR/JPY": "EURJPY=X",
+    "AUD/JPY": "AUDJPY=X",
 }
 
 TIMEFRAMES = ["5m", "15m", "1h", "4h", "1D"]
@@ -55,6 +64,11 @@ RSI_PERIOD = 14
 MAX_RETRIES = 3          # 1 lần đầu + 2 lần thử lại
 RETRY_DELAY_SEC = 5
 FAIL_ALERT_THRESHOLD = 6  # ~1 giờ liên tục lỗi (mỗi lần quét cách nhau 10 phút) mới báo lỗi
+
+# Giãn cách giữa các lượt gọi để tránh bị Yahoo Finance / Telegram chặn tạm thời
+# khi số mã theo dõi tăng lên (an toàn hơn, tốn thêm vài chục giây mỗi lần quét)
+YFINANCE_DELAY_SEC = 0.7
+TELEGRAM_DELAY_SEC = 1.2
 
 # Ngưỡng cho 2 setup - sửa ở đây nếu muốn đổi ngưỡng
 SELL_5M_MIN = 50
@@ -83,6 +97,8 @@ def send_telegram(text: str):
             print(f"[LỖI] Gửi Telegram thất bại: {r.status_code} {r.text}")
     except Exception as e:
         print(f"[LỖI] Gửi Telegram gặp ngoại lệ: {e}")
+    finally:
+        time.sleep(TELEGRAM_DELAY_SEC)  # giãn cách để tránh bị Telegram giới hạn tốc độ gửi
 
 
 def load_state():
@@ -152,6 +168,7 @@ def get_rsi_with_retry(ticker: str, timeframe: str):
             close = fetch_close_series(ticker, timeframe)
             rsi_series = calc_rsi(close)
             rsi_value = float(rsi_series.dropna().iloc[-1])
+            time.sleep(YFINANCE_DELAY_SEC)  # giãn cách để tránh bị Yahoo Finance chặn tạm thời
             return rsi_value, None
         except Exception as e:
             last_err = str(e)

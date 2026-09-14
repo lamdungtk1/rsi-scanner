@@ -16,6 +16,12 @@ NZD/USD, EUR/GBP, USD/CAD, EUR/JPY, AUD/JPY.
     - 15m trong khoảng 40–60
     - 1h, 4h, 1D đều > 50
 
+Đồng thời, mỗi tin nhắn còn gắn thêm nhãn "MẠNH" khi 5m đi xa hơn nữa:
+  - CANH SELL MẠNH: 5m > 70 (thêm vào cùng điều kiện CANH SELL ở trên)
+  - CANH BUY MẠNH:  5m < 30 (thêm vào cùng điều kiện CANH BUY ở trên)
+Đây chỉ là nhãn bổ sung để phân biệt mức độ, không phải điều kiện tách
+riêng — nếu không đạt mức MẠNH thì vẫn báo bình thường (không MẠNH).
+
 Cứ mỗi lần quét (10 phút/lần) mà mã đó vẫn đang thoả 1 trong 2 điều kiện
 trên thì vẫn gửi tin tiếp (không chỉ báo 1 lần duy nhất khi mới xuất hiện).
 Mỗi tin nhắn có kèm nhãn "🆕 MỚI XUẤT HIỆN" (lần quét trước chưa thoả,
@@ -75,6 +81,11 @@ SELL_5M_MIN = 50
 SELL_15M_RANGE = (40, 60)
 BUY_5M_MAX = 50
 BUY_15M_RANGE = (40, 60)
+
+# Ngưỡng "MẠNH" - gắn thêm nhãn khi 5m đi xa hơn (chỉ là nhãn bổ sung,
+# không thay thế điều kiện gốc ở trên)
+SELL_5M_STRONG = 70   # 5m > 70 -> "CANH SELL MẠNH"
+BUY_5M_STRONG = 30    # 5m < 30 -> "CANH BUY MẠNH"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -200,11 +211,21 @@ def check_setup(rsi: dict):
     return None
 
 
-def format_alert(name: str, setup: str, rsi_values: dict, is_new: bool) -> str:
+def is_strong_setup(setup: str, rsi: dict) -> bool:
+    """Gắn thêm nhãn MẠNH khi 5m đi xa hơn nữa (đồng thời với điều kiện gốc)."""
+    r5 = rsi["5m"]
     if setup == "sell":
-        emoji, label = "🔴", "CANH SELL"
+        return r5 > SELL_5M_STRONG
+    if setup == "buy":
+        return r5 < BUY_5M_STRONG
+    return False
+
+
+def format_alert(name: str, setup: str, rsi_values: dict, is_new: bool, is_strong: bool) -> str:
+    if setup == "sell":
+        emoji, label = "🔴", "CANH SELL MẠNH" if is_strong else "CANH SELL"
     else:
-        emoji, label = "🟢", "CANH BUY"
+        emoji, label = "🟢", "CANH BUY MẠNH" if is_strong else "CANH BUY"
 
     trang_thai = "🆕 MỚI XUẤT HIỆN" if is_new else "🔁 ĐANG TIẾP DIỄN"
 
@@ -261,9 +282,12 @@ def main():
 
         if setup is not None:
             is_new = (setup != old_status)
-            send_telegram(format_alert(name, setup, rsi_values, is_new))
+            is_strong = is_strong_setup(setup, rsi_values)
+            send_telegram(format_alert(name, setup, rsi_values, is_new, is_strong))
             trang_thai_log = "MỚI XUẤT HIỆN" if is_new else "ĐANG TIẾP DIỄN"
-            print(f"  -> ĐÃ GỬI CẢNH BÁO ({'CANH SELL' if setup == 'sell' else 'CANH BUY'}, {trang_thai_log})")
+            muc_do_log = "MẠNH" if is_strong else "thường"
+            nhan_log = "CANH SELL" if setup == "sell" else "CANH BUY"
+            print(f"  -> ĐÃ GỬI CẢNH BÁO ({nhan_log}, mức {muc_do_log}, {trang_thai_log})")
         else:
             print("  -> Chưa thoả điều kiện Canh Sell / Canh Buy, không báo")
 

@@ -1,0 +1,38 @@
+name: RSI Scanner
+
+on:
+  schedule:
+    # Chạy vào các phút 3,13,23,33,43,53 mỗi giờ (lệch giờ để tránh nghẽn
+    # do rất nhiều repo khác trên GitHub cũng đặt lịch chạy đúng phút :00)
+    - cron: "3,13,23,33,43,53 * * * *"
+  workflow_dispatch: {}   # cho phép bấm nút "Run workflow" để test thủ công
+
+permissions:
+  contents: write   # cần quyền ghi để bot tự lưu state.json vào repo
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cai dat thu vien
+        run: pip install -r requirements.txt
+
+      - name: Chay RSI scanner
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python rsi_scanner.py
+
+      - name: Luu lai state.json neu co thay doi
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Cap nhat state.json [auto]"
+          file_pattern: state.json

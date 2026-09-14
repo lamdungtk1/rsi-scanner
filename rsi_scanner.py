@@ -7,17 +7,19 @@ cho 6 mã: EUR/USD, GBP/USD, USD/JPY, Vàng, US30, US100.
 
   CANH SELL:
     - 5m  > 70   (quá mua)
-    - 15m trong khoảng 45–50
+    - 15m trong khoảng 40–60
     - 1h, 4h, 1D đều < 50
 
   CANH BUY:
     - 5m  < 30   (quá bán)
-    - 15m trong khoảng 50–55
+    - 15m trong khoảng 40–60
     - 1h, 4h, 1D đều > 50
 
 Cứ mỗi lần quét (10 phút/lần) mà mã đó vẫn đang thoả 1 trong 2 điều kiện
 trên thì vẫn gửi tin tiếp (không chỉ báo 1 lần duy nhất khi mới xuất hiện).
-Giờ hiển thị trong tin nhắn là giờ Việt Nam (UTC+7).
+Mỗi tin nhắn có kèm nhãn "🆕 MỚI XUẤT HIỆN" (lần quét trước chưa thoả,
+lần này mới thoả) hoặc "🔁 ĐANG TIẾP DIỄN" (đã báo từ lần quét trước, lần
+này vẫn còn thoả). Giờ hiển thị trong tin nhắn là giờ Việt Nam (UTC+7).
 
 Có lưu trạng thái vào state.json giữa các lần chạy (dùng để theo dõi lỗi
 kéo dài), có thử lại khi Yahoo Finance lỗi tạm thời.
@@ -56,9 +58,9 @@ FAIL_ALERT_THRESHOLD = 6  # ~1 giờ liên tục lỗi (mỗi lần quét cách 
 
 # Ngưỡng cho 2 setup - sửa ở đây nếu muốn đổi ngưỡng
 SELL_5M_MIN = 70
-SELL_15M_RANGE = (45, 50)
+SELL_15M_RANGE = (40, 60)
 BUY_5M_MAX = 30
-BUY_15M_RANGE = (50, 55)
+BUY_15M_RANGE = (40, 60)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -181,13 +183,15 @@ def check_setup(rsi: dict):
     return None
 
 
-def format_alert(name: str, setup: str, rsi_values: dict) -> str:
+def format_alert(name: str, setup: str, rsi_values: dict, is_new: bool) -> str:
     if setup == "sell":
         emoji, label = "🔴", "CANH SELL"
     else:
         emoji, label = "🟢", "CANH BUY"
 
-    lines = [f"{emoji} <b>{name}</b> — {label}"]
+    trang_thai = "🆕 MỚI XUẤT HIỆN" if is_new else "🔁 ĐANG TIẾP DIỄN"
+
+    lines = [f"{emoji} <b>{name}</b> — {label}", trang_thai]
     for tf in TIMEFRAMES:
         v = rsi_values.get(tf)
         lines.append(f"  • {tf}: {v:.1f}" if v is not None else f"  • {tf}: (n/a)")
@@ -239,8 +243,10 @@ def main():
         old_status = sym_state.get("status")
 
         if setup is not None:
-            send_telegram(format_alert(name, setup, rsi_values))
-            print(f"  -> ĐÃ GỬI CẢNH BÁO ({'CANH SELL' if setup == 'sell' else 'CANH BUY'})")
+            is_new = (setup != old_status)
+            send_telegram(format_alert(name, setup, rsi_values, is_new))
+            trang_thai_log = "MỚI XUẤT HIỆN" if is_new else "ĐANG TIẾP DIỄN"
+            print(f"  -> ĐÃ GỬI CẢNH BÁO ({'CANH SELL' if setup == 'sell' else 'CANH BUY'}, {trang_thai_log})")
         else:
             print("  -> Chưa thoả điều kiện Canh Sell / Canh Buy, không báo")
 

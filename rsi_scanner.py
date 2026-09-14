@@ -6,12 +6,12 @@ cho 6 mã: EUR/USD, GBP/USD, USD/JPY, Vàng, US30, US100.
 Điều kiện báo (2 setup):
 
   CANH SELL:
-    - 5m  > 70   (quá mua)
+    - 5m  > 50
     - 15m trong khoảng 40–60
     - 1h, 4h, 1D đều < 50
 
   CANH BUY:
-    - 5m  < 30   (quá bán)
+    - 5m  < 50
     - 15m trong khoảng 40–60
     - 1h, 4h, 1D đều > 50
 
@@ -57,9 +57,9 @@ RETRY_DELAY_SEC = 5
 FAIL_ALERT_THRESHOLD = 6  # ~1 giờ liên tục lỗi (mỗi lần quét cách nhau 10 phút) mới báo lỗi
 
 # Ngưỡng cho 2 setup - sửa ở đây nếu muốn đổi ngưỡng
-SELL_5M_MIN = 70
+SELL_5M_MIN = 50
 SELL_15M_RANGE = (40, 60)
-BUY_5M_MAX = 30
+BUY_5M_MAX = 50
 BUY_15M_RANGE = (40, 60)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")

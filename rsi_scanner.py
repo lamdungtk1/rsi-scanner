@@ -3,21 +3,36 @@
 RSI Scanner - Quét RSI(14) trên 5 khung thời gian (5m/15m/1h/4h/1D)
 cho 6 mã: EUR/USD, GBP/USD, USD/JPY, Vàng, US30, US100.
 
-Khi cả 5 khung của 1 mã CÙNG đồng thuận (toàn bộ > 50 hoặc toàn bộ < 50)
--> gửi tin nhắn Telegram (đẩy push notification lên điện thoại).
+Điều kiện báo (2 setup):
 
-Không gửi lặp lại khi trạng thái chưa đổi (chống spam), có lưu trạng thái
-vào state.json giữa các lần chạy, có thử lại khi Yahoo Finance lỗi tạm thời.
+  CANH SELL:
+    - 5m  > 70   (quá mua)
+    - 15m trong khoảng 45–50
+    - 1h, 4h, 1D đều < 50
+
+  CANH BUY:
+    - 5m  < 30   (quá bán)
+    - 15m trong khoảng 50–55
+    - 1h, 4h, 1D đều > 50
+
+Cứ mỗi lần quét (10 phút/lần) mà mã đó vẫn đang thoả 1 trong 2 điều kiện
+trên thì vẫn gửi tin tiếp (không chỉ báo 1 lần duy nhất khi mới xuất hiện).
+Giờ hiển thị trong tin nhắn là giờ Việt Nam (UTC+7).
+
+Có lưu trạng thái vào state.json giữa các lần chạy (dùng để theo dõi lỗi
+kéo dài), có thử lại khi Yahoo Finance lỗi tạm thời.
 """
 
 import os
 import json
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import pandas as pd
 import yfinance as yf
 import requests
+
+VN_TZ = timezone(timedelta(hours=7))
 
 STATE_FILE = "state.json"
 
@@ -38,6 +53,12 @@ RSI_PERIOD = 14
 MAX_RETRIES = 3          # 1 lần đầu + 2 lần thử lại
 RETRY_DELAY_SEC = 5
 FAIL_ALERT_THRESHOLD = 6  # ~1 giờ liên tục lỗi (mỗi lần quét cách nhau 10 phút) mới báo lỗi
+
+# Ngưỡng cho 2 setup - sửa ở đây nếu muốn đổi ngưỡng
+SELL_5M_MIN = 70
+SELL_15M_RANGE = (45, 50)
+BUY_5M_MAX = 30
+BUY_15M_RANGE = (50, 55)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -138,14 +159,40 @@ def get_rsi_with_retry(ticker: str, timeframe: str):
     return None, last_err
 
 
-def format_alert(name: str, direction: str, rsi_values: dict) -> str:
-    emoji = "🟢" if direction == "TĂNG" else "🔴"
-    lines = [f"{emoji} <b>{name}</b> — RSI(14) đồng thuận {direction} trên cả 5 khung"]
+def check_setup(rsi: dict):
+    """Trả về 'sell', 'buy' hoặc None dựa trên 5 giá trị RSI đã lấy được."""
+    r5, r15, r1h, r4h, r1d = (rsi["5m"], rsi["15m"], rsi["1h"], rsi["4h"], rsi["1D"])
+
+    is_sell = (
+        r5 > SELL_5M_MIN
+        and SELL_15M_RANGE[0] <= r15 <= SELL_15M_RANGE[1]
+        and r1h < 50 and r4h < 50 and r1d < 50
+    )
+    is_buy = (
+        r5 < BUY_5M_MAX
+        and BUY_15M_RANGE[0] <= r15 <= BUY_15M_RANGE[1]
+        and r1h > 50 and r4h > 50 and r1d > 50
+    )
+
+    if is_sell:
+        return "sell"
+    if is_buy:
+        return "buy"
+    return None
+
+
+def format_alert(name: str, setup: str, rsi_values: dict) -> str:
+    if setup == "sell":
+        emoji, label = "🔴", "CANH SELL"
+    else:
+        emoji, label = "🟢", "CANH BUY"
+
+    lines = [f"{emoji} <b>{name}</b> — {label}"]
     for tf in TIMEFRAMES:
         v = rsi_values.get(tf)
         lines.append(f"  • {tf}: {v:.1f}" if v is not None else f"  • {tf}: (n/a)")
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    lines.append(f"🕒 {now}")
+    now = datetime.now(VN_TZ).strftime("%Y-%m-%d %H:%M")
+    lines.append(f"🕒 {now} (giờ VN)")
     return "\n".join(lines)
 
 
@@ -188,30 +235,21 @@ def main():
                 sym_state["fail_notified"] = False
                 changed = True
 
-        values = list(rsi_values.values())
-        if all(v > 50 for v in values):
-            new_status = "bull"
-        elif all(v < 50 for v in values):
-            new_status = "bear"
-        else:
-            new_status = "none"
-
+        setup = check_setup(rsi_values)
         old_status = sym_state.get("status")
 
-        if new_status in ("bull", "bear") and new_status != old_status:
-            direction = "TĂNG" if new_status == "bull" else "GIẢM"
-            send_telegram(format_alert(name, direction, rsi_values))
-            print("  -> ĐÃ GỬI CẢNH BÁO")
-            changed = True
-        elif new_status != old_status:
-            print(f"  -> Trạng thái đổi thành '{new_status}' (chưa đủ đồng thuận cả 5 khung, không báo)")
-            changed = True
+        if setup is not None:
+            send_telegram(format_alert(name, setup, rsi_values))
+            print(f"  -> ĐÃ GỬI CẢNH BÁO ({'CANH SELL' if setup == 'sell' else 'CANH BUY'})")
         else:
-            print(f"  -> Trạng thái không đổi ({old_status}) -> không gửi lại để tránh spam")
+            print("  -> Chưa thoả điều kiện Canh Sell / Canh Buy, không báo")
 
-        sym_state["status"] = new_status
+        if setup != old_status:
+            changed = True
+
+        sym_state["status"] = setup
         sym_state["last_rsi"] = rsi_values
-        sym_state["last_check"] = datetime.now(timezone.utc).isoformat()
+        sym_state["last_check"] = datetime.now(VN_TZ).isoformat()
         state[key] = sym_state
 
     if changed:

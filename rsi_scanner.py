@@ -64,17 +64,26 @@ YFINANCE_DELAY_SEC = 0.7
 TELEGRAM_DELAY_SEC = 1.2
 
 # --- Ngưỡng RSI setup ---
-SELL_5M_MIN = 50
-SELL_15M_RANGE = (40, 60)
-BUY_5M_MAX = 50
-BUY_15M_RANGE = (40, 60)
-SELL_5M_STRONG = 70
-BUY_5M_STRONG = 30
+# CANH SELL (thường): 5m trong 50-70, và 15m/1h/4h/1D đều < 50
+SELL_5M_RANGE = (50, 70)
+SELL_15M_MAX_NORMAL = 50
+# CANH BUY (thường): 5m trong 30-50, và 15m/1h/4h/1D đều > 50
+BUY_5M_RANGE = (30, 50)
+BUY_15M_MIN_NORMAL = 50
+# CANH SELL MẠNH: 5m > 70, 15m < 60, và 1h/4h/1D đều < 50
+SELL_STRONG_5M_MIN = 70
+SELL_STRONG_15M_MAX = 60
+# CANH BUY MẠNH: 5m < 30, 15m > 40, và 1h/4h/1D đều > 50
+BUY_STRONG_5M_MAX = 30
+BUY_STRONG_15M_MIN = 40
 
 # --- Phân kỳ (module 2) ---
-DIVERGENCE_TIMEFRAME = "15m"
-DIVERGENCE_PIVOT_ORDER = 3     # cần 3 nến mỗi bên để xác nhận 1 đỉnh/đáy
-DIVERGENCE_LOOKBACK_BARS = 150  # chỉ xét trong khoảng 150 nến 15m gần nhất
+DIVERGENCE_TIMEFRAMES = ["15m", "1h", "4h", "1D"]  # không xét khung 5m
+DIVERGENCE_PIVOT_ORDER = 3  # cần 3 nến mỗi bên để xác nhận 1 đỉnh/đáy
+DIVERGENCE_LOOKBACK_BARS = {"15m": 150, "1h": 150, "4h": 120, "1D": 120}
+# Khi phân kỳ còn tiếp diễn, chỉ báo lại theo đúng chu kỳ của khung đó
+# (15 phút/lần cho 15m, 1 giờ/lần cho 1h, 4 giờ/lần cho 4h, 1 ngày/lần cho 1D)
+DIVERGENCE_REPEAT_MINUTES = {"15m": 15, "1h": 60, "4h": 240, "1D": 1440}
 
 # --- Lịch tin tức (module 3) ---
 FOREXFACTORY_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
@@ -242,52 +251,38 @@ def fetch_close_and_rsi_with_retry(ticker: str, timeframe: str):
     return None, None, last_err
 
 
-def get_rsi_with_retry(ticker: str, timeframe: str):
-    close, rsi_series, err = fetch_close_and_rsi_with_retry(ticker, timeframe)
-    if err:
-        return None, err
-    return float(rsi_series.dropna().iloc[-1]), None
-
-
 # ============================================================================
 # MODULE 1: RSI SETUP (CANH SELL / CANH BUY)
 # ============================================================================
 
 def check_setup(rsi: dict):
+    """Trả về (setup, is_strong): setup là 'sell'/'buy'/None.
+    Sell/Buy thường và Mạnh là 2 nhánh độc lập (không phải Mạnh nằm trong Thường)."""
     r5, r15, r1h, r4h, r1d = (rsi["5m"], rsi["15m"], rsi["1h"], rsi["4h"], rsi["1D"])
 
-    is_sell = (
-        r5 > SELL_5M_MIN
-        and SELL_15M_RANGE[0] <= r15 <= SELL_15M_RANGE[1]
-        and r1h < 50 and r4h < 50 and r1d < 50
-    )
-    is_buy = (
-        r5 < BUY_5M_MAX
-        and BUY_15M_RANGE[0] <= r15 <= BUY_15M_RANGE[1]
-        and r1h > 50 and r4h > 50 and r1d > 50
-    )
+    sell_context = r1h < 50 and r4h < 50 and r1d < 50
+    buy_context = r1h > 50 and r4h > 50 and r1d > 50
 
-    if is_sell:
-        return "sell"
-    if is_buy:
-        return "buy"
-    return None
+    if sell_context:
+        if r5 > SELL_STRONG_5M_MIN and r15 < SELL_STRONG_15M_MAX:
+            return "sell", True
+        if SELL_5M_RANGE[0] <= r5 <= SELL_5M_RANGE[1] and r15 < SELL_15M_MAX_NORMAL:
+            return "sell", False
 
+    if buy_context:
+        if r5 < BUY_STRONG_5M_MAX and r15 > BUY_STRONG_15M_MIN:
+            return "buy", True
+        if BUY_5M_RANGE[0] <= r5 <= BUY_5M_RANGE[1] and r15 > BUY_15M_MIN_NORMAL:
+            return "buy", False
 
-def is_strong_setup(setup: str, rsi: dict) -> bool:
-    r5 = rsi["5m"]
-    if setup == "sell":
-        return r5 > SELL_5M_STRONG
-    if setup == "buy":
-        return r5 < BUY_5M_STRONG
-    return False
+    return None, False
 
 
 def format_rsi_alert(name: str, setup: str, rsi_values: dict, is_new: bool, is_strong: bool) -> str:
     if setup == "sell":
-        emoji, label = "🔴", "CANH SELL MẠNH" if is_strong else "CANH SELL"
+        emoji, label = ("🔴🔴", "CANH SELL MẠNH") if is_strong else ("🔴", "CANH SELL")
     else:
-        emoji, label = "🟢", "CANH BUY MẠNH" if is_strong else "CANH BUY"
+        emoji, label = ("🟢🟢", "CANH BUY MẠNH") if is_strong else ("🟢", "CANH BUY")
 
     trang_thai = "🆕 MỚI XUẤT HIỆN" if is_new else "🔁 ĐANG TIẾP DIỄN"
 
@@ -302,12 +297,11 @@ def format_rsi_alert(name: str, setup: str, rsi_values: dict, is_new: bool, is_s
 def run_rsi_module(name, ticker, rsi_values, state, changed_flags):
     sym_state = state.setdefault("rsi", {}).setdefault(ticker, {"status": None})
 
-    setup = check_setup(rsi_values)
+    setup, is_strong = check_setup(rsi_values)
     old_status = sym_state.get("status")
 
     if setup is not None:
         is_new = (setup != old_status)
-        is_strong = is_strong_setup(setup, rsi_values)
         send_telegram(format_rsi_alert(name, setup, rsi_values, is_new, is_strong))
         trang_thai_log = "MỚI XUẤT HIỆN" if is_new else "ĐANG TIẾP DIỄN"
         muc_do_log = "MẠNH" if is_strong else "thường"
@@ -341,10 +335,12 @@ def find_pivots(values, order=DIVERGENCE_PIVOT_ORDER):
     return highs, lows
 
 
-def detect_divergence(close: pd.Series, rsi: pd.Series):
+def detect_divergence(close: pd.Series, rsi: pd.Series, lookback_bars: int):
     """Trả về ('bull' | 'bear' | None, pivot_timestamp) dựa trên phân kỳ đơn giản
-    (regular divergence) giữa 2 đỉnh/đáy giá gần nhất và 2 đỉnh/đáy RSI tương ứng."""
-    df = pd.DataFrame({"close": close, "rsi": rsi}).dropna().tail(DIVERGENCE_LOOKBACK_BARS)
+    (regular divergence) giữa 2 đỉnh/đáy giá gần nhất và 2 đỉnh/đáy RSI tương ứng.
+    Luôn trả về cặp đỉnh/đáy GẦN NHẤT trong lookback (không giới hạn "vừa xác nhận") -
+    việc báo lại bao lâu 1 lần do run_divergence_module quyết định theo thời gian."""
+    df = pd.DataFrame({"close": close, "rsi": rsi}).dropna().tail(lookback_bars)
     n = len(df)
     if n < DIVERGENCE_PIVOT_ORDER * 2 + 5:
         return None, None
@@ -353,58 +349,76 @@ def detect_divergence(close: pd.Series, rsi: pd.Series):
     rsi_vals = df["rsi"].values
     highs_idx, lows_idx = find_pivots(vals)
 
-    # Chỉ coi là "mới" nếu đỉnh/đáy gần nhất nằm ở cuối chuỗi dữ liệu (vừa được xác nhận)
-    freshest_possible = n - DIVERGENCE_PIVOT_ORDER - 1
-
     if len(highs_idx) >= 2:
         i1, i2 = highs_idx[-2], highs_idx[-1]
-        if i2 >= freshest_possible - 1 and vals[i2] > vals[i1] and rsi_vals[i2] < rsi_vals[i1]:
+        if vals[i2] > vals[i1] and rsi_vals[i2] < rsi_vals[i1]:
             return "bear", df.index[i2]
 
     if len(lows_idx) >= 2:
         i1, i2 = lows_idx[-2], lows_idx[-1]
-        if i2 >= freshest_possible - 1 and vals[i2] < vals[i1] and rsi_vals[i2] > rsi_vals[i1]:
+        if vals[i2] < vals[i1] and rsi_vals[i2] > rsi_vals[i1]:
             return "bull", df.index[i2]
 
     return None, None
 
 
-def format_divergence_alert(name: str, kind: str, price_at_pivot: float, rsi_at_pivot: float, is_new: bool) -> str:
+def format_divergence_alert(name: str, tf: str, kind: str, price_at_pivot: float,
+                             rsi_at_pivot: float, is_new: bool) -> str:
     emoji = "🟣"
     label = "PHÂN KỲ TĂNG (Bullish)" if kind == "bull" else "PHÂN KỲ GIẢM (Bearish)"
+    suggestion = "🟢 Đề xuất: BUY" if kind == "bull" else "🔴 Đề xuất: SELL"
     trang_thai = "🆕 MỚI XUẤT HIỆN" if is_new else "🔁 ĐANG TIẾP DIỄN"
     lines = [
-        f"{emoji} <b>{name}</b> — {label} (khung 15m)",
+        f"{emoji} <b>{name}</b> — {label} (khung {tf})",
         trang_thai,
         f"Tại điểm phân kỳ: giá {price_at_pivot:.5f}, RSI {rsi_at_pivot:.1f}",
+        suggestion,
         f"🕒 {now_vn_str()} (giờ VN)",
     ]
     return "\n".join(lines)
 
 
-def run_divergence_module(name, ticker, close_15m, rsi_15m, state):
-    if close_15m is None or rsi_15m is None:
-        print("  -> [Phân kỳ] Bỏ qua do thiếu dữ liệu 15m")
+def run_divergence_module(name, ticker, tf, close, rsi, state):
+    if close is None or rsi is None:
+        print(f"  -> [Phân kỳ {tf}] Bỏ qua do thiếu dữ liệu")
         return
 
-    kind, pivot_ts = detect_divergence(close_15m, rsi_15m)
+    lookback = DIVERGENCE_LOOKBACK_BARS[tf]
+    kind, pivot_ts = detect_divergence(close, rsi, lookback)
     if kind is None:
-        print("  -> [Phân kỳ] Chưa phát hiện phân kỳ mới")
+        print(f"  -> [Phân kỳ {tf}] Chưa phát hiện phân kỳ")
         return
 
-    div_state = state.setdefault("divergence", {}).setdefault(ticker, {})
+    div_state = state.setdefault("divergence", {}).setdefault(ticker, {}).setdefault(tf, {})
     ts_key = f"{kind}_ts"
+    last_sent_key = f"{kind}_last_sent"
     pivot_iso = pivot_ts.isoformat()
-    is_new = div_state.get(ts_key) != pivot_iso
 
-    price_at_pivot = float(close_15m.loc[pivot_ts])
-    rsi_at_pivot = float(rsi_15m.loc[pivot_ts])
+    is_new_pivot = div_state.get(ts_key) != pivot_iso
+    now = datetime.now(VN_TZ)
 
-    send_telegram(format_divergence_alert(name, kind, price_at_pivot, rsi_at_pivot, is_new))
-    print(f"  -> [Phân kỳ] ĐÃ GỬI CẢNH BÁO ({'BULL' if kind == 'bull' else 'BEAR'}, "
-          f"{'MỚI' if is_new else 'TIẾP DIỄN'})")
+    should_send = is_new_pivot
+    if not should_send:
+        last_sent_raw = div_state.get(last_sent_key)
+        if last_sent_raw is None:
+            should_send = True
+        else:
+            elapsed_min = (now - datetime.fromisoformat(last_sent_raw)).total_seconds() / 60
+            should_send = elapsed_min >= DIVERGENCE_REPEAT_MINUTES[tf]
+
+    if not should_send:
+        print(f"  -> [Phân kỳ {tf}] Vẫn còn hiệu lực nhưng chưa tới chu kỳ báo lại")
+        return
+
+    price_at_pivot = float(close.loc[pivot_ts])
+    rsi_at_pivot = float(rsi.loc[pivot_ts])
+
+    send_telegram(format_divergence_alert(name, tf, kind, price_at_pivot, rsi_at_pivot, is_new_pivot))
+    print(f"  -> [Phân kỳ {tf}] ĐÃ GỬI CẢNH BÁO ({'BULL' if kind == 'bull' else 'BEAR'}, "
+          f"{'MỚI' if is_new_pivot else 'TIẾP DIỄN'})")
 
     div_state[ts_key] = pivot_iso
+    div_state[last_sent_key] = now.isoformat()
 
 
 # ============================================================================
@@ -471,7 +485,7 @@ def check_sonic_r(df: pd.DataFrame):
 
 
 def format_sonic_alert(name: str, setup: str, info: dict, is_new: bool) -> str:
-    emoji = "🟢" if setup == "buy" else "🔴"
+    emoji = "🟢🟢🟢" if setup == "buy" else "🔴🔴🔴"
     label = "SONIC R - VÀO LỆNH BUY" if setup == "buy" else "SONIC R - VÀO LỆNH SELL"
     trang_thai = "🆕 MỚI XUẤT HIỆN" if is_new else "🔁 ĐANG TIẾP DIỄN"
     lines = [
@@ -535,6 +549,39 @@ def parse_event_datetime(event: dict):
         return None
 
 
+def parse_calendar_number(raw):
+    """Phân tích số từ chuỗi kiểu '1.2%', '150K', '-0.3', '-' ... Trả về None nếu không parse được."""
+    if not raw or str(raw).strip() in ("-", ""):
+        return None
+    s = str(raw).strip().replace(",", "").replace("%", "")
+    mult = 1
+    if s and s[-1].upper() == "K":
+        mult, s = 1_000, s[:-1]
+    elif s and s[-1].upper() == "M":
+        mult, s = 1_000_000, s[:-1]
+    elif s and s[-1].upper() == "B":
+        mult, s = 1_000_000_000, s[:-1]
+    try:
+        return float(s) * mult
+    except (ValueError, TypeError):
+        return None
+
+
+def guess_calendar_direction(event: dict) -> str:
+    """Dự đoán RẤT THÔ dựa trên so sánh Dự báo vs Kỳ trước - KHÔNG phải dự đoán
+    thực sự vì kết quả thực tế (Actual) chỉ biết sau khi tin ra. Chỉ mang tính
+    tham khảo về xu hướng kỳ vọng, không phải khuyến nghị giao dịch."""
+    f = parse_calendar_number(event.get("forecast"))
+    p = parse_calendar_number(event.get("previous"))
+    if f is None or p is None:
+        return "Không đủ số liệu (thiếu Dự báo hoặc Kỳ trước) để ước đoán xu hướng."
+    if f > p:
+        return "Dự báo > Kỳ trước → nếu số thực tế khớp/vượt dự báo, thường nghiêng về TĂNG cho đồng tiền này (dự đoán rất thô, chỉ tham khảo)."
+    if f < p:
+        return "Dự báo < Kỳ trước → nếu số thực tế khớp/thấp hơn dự báo, thường nghiêng về GIẢM cho đồng tiền này (dự đoán rất thô, chỉ tham khảo)."
+    return "Dự báo bằng Kỳ trước → chưa có nghiêng rõ ràng (dự đoán rất thô, chỉ tham khảo)."
+
+
 def format_calendar_reminder(event: dict, dt_vn: datetime) -> str:
     title = event.get("title", "(không rõ tên tin)")
     country = event.get("country", "")
@@ -547,6 +594,7 @@ def format_calendar_reminder(event: dict, dt_vn: datetime) -> str:
         f"🔴 <b>{country} — {title}</b>",
         f"🕒 Giờ tin: {time_str} (giờ VN)",
         f"Dự báo: {forecast}  |  Kỳ trước: {previous}",
+        f"📊 {guess_calendar_direction(event)}",
     ]
     return "\n".join(lines)
 
@@ -710,29 +758,21 @@ def main():
     state = load_state()
     changed_flags = {"changed": False}
 
-    # --- Module 1 + 2: quét từng mã (RSI setup + phân kỳ 15m) ---
+    # --- Module 1 + 2: quét từng mã (RSI setup + phân kỳ đa khung) ---
     for name, ticker in SYMBOLS.items():
         print(f"\n=== Đang quét {name} ({ticker}) ===")
         rsi_values = {}
         error_tf = []
-        close_15m, rsi_15m = None, None
+        series_by_tf = {}  # tf -> (close_series, rsi_series), dùng cho module phân kỳ
 
         for tf in TIMEFRAMES:
-            if tf == DIVERGENCE_TIMEFRAME:
-                close, rsi_series, err = fetch_close_and_rsi_with_retry(ticker, tf)
-                if err:
-                    error_tf.append(tf)
-                else:
-                    close_15m, rsi_15m = close, rsi_series
-                    rsi_values[tf] = float(rsi_series.dropna().iloc[-1])
-                    print(f"  {tf}: RSI = {rsi_values[tf]:.2f}")
+            close, rsi_series, err = fetch_close_and_rsi_with_retry(ticker, tf)
+            if err:
+                error_tf.append(tf)
             else:
-                rsi_value, err = get_rsi_with_retry(ticker, tf)
-                if err:
-                    error_tf.append(tf)
-                else:
-                    rsi_values[tf] = rsi_value
-                    print(f"  {tf}: RSI = {rsi_value:.2f}")
+                series_by_tf[tf] = (close, rsi_series)
+                rsi_values[tf] = float(rsi_series.dropna().iloc[-1])
+                print(f"  {tf}: RSI = {rsi_values[tf]:.2f}")
 
         fail_state = state.setdefault("rsi_fail", {}).setdefault(ticker, {"fail_count": 0, "fail_notified": False})
 
@@ -755,7 +795,10 @@ def main():
                 changed_flags["changed"] = True
 
         run_rsi_module(name, ticker, rsi_values, state, changed_flags)
-        run_divergence_module(name, ticker, close_15m, rsi_15m, state)
+
+        for tf in DIVERGENCE_TIMEFRAMES:
+            close, rsi_series = series_by_tf.get(tf, (None, None))
+            run_divergence_module(name, ticker, tf, close, rsi_series, state)
 
         sonic_df, sonic_err = fetch_ohlc_with_retry(
             ticker, SONIC_TIMEFRAME, period_override=SONIC_HISTORY_PERIOD,

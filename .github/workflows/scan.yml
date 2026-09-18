@@ -2,37 +2,171 @@ name: RSI Scanner
 
 on:
   schedule:
-    # Chạy vào các phút 3,13,23,33,43,53 mỗi giờ (lệch giờ để tránh nghẽn
-    # do rất nhiều repo khác trên GitHub cũng đặt lịch chạy đúng phút :00)
+    # Keep the existing schedule: every 10 minutes, at :03, :13, ..., :53.
     - cron: "3,13,23,33,43,53 * * * *"
-  workflow_dispatch: {}   # cho phép bấm nút "Run workflow" để test thủ công
+  workflow_dispatch:
+    inputs:
+      test_telegram:
+        description: "Gui 1 tin nhan kiem tra Telegram"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
-  contents: write   # cần quyền ghi để bot tự lưu state.json vào repo
+  contents: write
+
+# Both scheduled and manual scans share this lock. Never interrupt a scan
+# merely because the next scheduled run arrives.
+concurrency:
+  group: rsi-scanner-main
+  cancel-in-progress: false
 
 jobs:
   scan:
+    # This is the existing production branch shown in the supplied screenshot.
+    if: ${{ github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
+        with:
+          # Fetch the current branch tip AFTER waiting for the concurrency lock.
+          # This includes state.json saved by the preceding run.
+          ref: main
+          persist-credentials: true
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
 
       - name: Cai dat thu vien
-        run: pip install -r requirements.txt
+        run: python -m pip install -r requirements.txt
 
-      - name: Chay RSI scanner
+      - name: Kiem tra cau hinh va ma nguon
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python rsi_scanner.py
+        run: |
+          python -m py_compile rsi_scanner.py
+          python - <<'PY'
+          import json
+          import os
+          from importlib.metadata import version
+          from pathlib import Path
+          import rsi_scanner as scanner
+
+          for key in ("TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID"):
+              if not os.environ.get(key, "").strip():
+                  raise SystemExit(f"::error::Thieu GitHub Secret: {key}. Khong in ma bi mat ra log.")
+          if scanner.yf is None:
+              raise SystemExit("::error::Chua cai duoc thu vien yfinance.")
+          if not callable(getattr(scanner, "run_3489_module", None)):
+              raise SystemExit("::error::rsi_scanner.py chua phai ban setup 3489 moi.")
+          if not Path("state.json").is_file():
+              raise SystemExit("::error::Khong tim thay state.json. Khong tu tao trang thai rong.")
+          state = json.loads(Path("state.json").read_text(encoding="utf-8"))
+          if not isinstance(state, dict):
+              raise SystemExit("::error::state.json phai la mot JSON object.")
+          for package in ("yfinance", "pandas", "requests", "tzdata"):
+              print(f"[CHECK] {package}={version(package)}")
+          print("[CHECK] Da nap ban setup 3489; cau hinh va state.json hop le.")
+          PY
+
+      - name: Gui tin kiem tra Telegram
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.test_telegram }}
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python - <<'PY'
+          import rsi_scanner as scanner
+
+          message = (
+              "\u2705 KI\u1ec2M TRA K\u1ebeT N\u1ed0I TELEGRAM\n"
+              "Tin th\u1eed t\u1eeb GitHub Actions.\n"
+              "\u0110\u00e2y kh\u00f4ng ph\u1ea3i t\u00edn hi\u1ec7u giao d\u1ecbch.\n"
+              "Tin n\u00e0y ch\u1ec9 ki\u1ec3m tra kh\u1ea3 n\u0103ng g\u1eedi Telegram; "
+              "ch\u01b0a x\u00e1c nh\u1eadn d\u1eef li\u1ec7u gi\u00e1 hay k\u1ebft qu\u1ea3 qu\u00e9t.\n"
+              f"Gi\u1edd VN: {scanner.now_vn_str()}"
+          )
+          if not scanner.send_telegram(message):
+              raise SystemExit("::error::Gui tin kiem tra Telegram that bai. Xem buoc nay de biet loi.")
+          print("[CHECK] Telegram da xac nhan nhan tin kiem tra.")
+          PY
+
+      - name: Chay RSI scanner
+        id: scan_run
+        timeout-minutes: 20
+        shell: bash
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set -euo pipefail
+          python -u rsi_scanner.py 2>&1 | tee "${RUNNER_TEMP}/rsi-scanner.log"
+
+      # Preserve valid checkpoints even if Python reported a normal failure.
+      # A cancelled job/runner outage cannot guarantee that this step will run.
+      - name: Kiem tra state.json sau khi quet
+        id: state_check
+        if: ${{ !cancelled() && (steps.scan_run.outcome == 'success' || steps.scan_run.outcome == 'failure') }}
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          state = json.loads(Path("state.json").read_text(encoding="utf-8"))
+          if not isinstance(state, dict):
+              raise SystemExit("::error::state.json khong hop le; khong ghi de len GitHub.")
+          print("[CHECK] state.json hop le, san sang luu len GitHub.")
+          PY
 
       - name: Luu lai state.json neu co thay doi
-        uses: stefanzweifel/git-auto-commit-action@v5
+        id: save_state
+        if: ${{ !cancelled() && steps.state_check.outcome == 'success' }}
+        uses: stefanzweifel/git-auto-commit-action@v7
         with:
+          branch: main
           commit_message: "Cap nhat state.json [auto]"
           file_pattern: state.json
+
+      # The scanner handles some failures without a non-zero exit code.
+      # Surface its known data/Telegram error messages AFTER saving state.
+      # This is an operational log check, not validation of signal accuracy.
+      - name: Kiem tra loi trong lan quet
+        if: ${{ !cancelled() && (steps.scan_run.outcome == 'success' || steps.scan_run.outcome == 'failure') }}
+        env:
+          SCAN_OUTCOME: ${{ steps.scan_run.outcome }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          logfile = Path(os.environ["RUNNER_TEMP"]) / "rsi-scanner.log"
+          if not logfile.is_file():
+              raise SystemExit("::error::Khong tim thay nhat ky quet.")
+          log = logfile.read_text(encoding="utf-8", errors="replace")
+          checks = {
+              "Missing/invalid data:": "Thieu hoac loi du lieu o it nhat mot ma/khung thoi gian",
+              "[3489] Processing failed:": "Loi xu ly setup 3489",
+              "[TELEGRAM] Missing": "Thieu cau hinh Telegram",
+              "[TELEGRAM] HTTP": "Telegram tu choi yeu cau gui tin",
+              "[TELEGRAM] Request failed": "Loi ket noi hoac phan hoi Telegram",
+          }
+          problems = [label for marker, label in checks.items() if marker in log]
+          if os.environ.get("SCAN_OUTCOME") != "success":
+              problems.append("Chuong trinh quet ket thuc voi loi")
+          if "Saved state.json" not in log:
+              problems.append("Chua thay xac nhan ket thuc va luu trang thai cua chuong trinh")
+          if problems:
+              for problem in problems:
+                  print(f"::error::{problem}. Mo buoc 'Chay RSI scanner' de xem chi tiet.")
+              raise SystemExit(1)
+          print("[CHECK] Khong phat hien cac mau loi du lieu/3489/Telegram duoc kiem tra.")
+          print("[CHECK] Khong co tin hieu moi khong phai la loi. Xem log [3489] de doi chieu.")
+          PY

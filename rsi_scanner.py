@@ -1,30 +1,32 @@
 # -*- coding: utf-8 -*-
 """
-RSI Scanner + 4 module cảnh báo bổ sung - chạy mỗi 10 phút qua GitHub Actions.
+RSI Scanner + Setup 3489 / Setup 3489 with M5 structure break.
+Derived from the user's uploaded script. The legacy RSI, calendar, sessions
+and heartbeat modules are retained and can be disabled independently.
 
-Các module trong file này:
-  1. RSI SETUP (CANH SELL / CANH BUY) - có nhãn MẠNH.
-  2. LỊCH TIN TỨC Forex Factory - tổng hợp tin đỏ trong 24h tới lúc 8h30 sáng, và
-     báo thêm 1 lần trước mỗi tin khoảng 15 phút. Dữ liệu tải 1 lần/tuần.
-  3. CẢNH BÁO MỞ/ĐÓNG PHIÊN giao dịch (Sydney/Tokyo/London/New York).
-  4. PING ĐỊNH KỲ mỗi ngày để xác nhận hệ thống còn sống.
-  5. HỆ THỐNG EMA34/89 riêng: khung M15, pullback chạm EMA89 rồi bật lại cắt cả
-     EMA34 và EMA89, xác nhận thêm bằng RSI H4 + D1, có bộ lọc hỗ trợ/kháng cự
-     và R:R tối thiểu, cùng xác nhận chéo giữa các mã tương quan.
+3489 type 1: M15 EMA34/89 pullback/recovery + H4/D1 RSI confirmation.
+3489 type 2: type 1 + a fresh confirmed LH/HL closing break on M5 in the
+same completing M15 candle. No additional confluence or trade planning.
 
-Toàn bộ giờ hiển thị là giờ Việt Nam (UTC+7). Trạng thái được lưu chung
-trong 1 file state.json (nhiều "ngăn" riêng cho từng module) để commit
-lại vào repo không cần sửa workflow.
+3489 uses closed bars with as-of higher-timeframe RSI and separate persistent
+notification keys. Times displayed to the user are Vietnam time (UTC+7).
+The scheduler must persist state.json between runs and avoid concurrent runs.
+See README_setup3489.md for assumptions and testing limitations.
 """
 
 import os
 import json
 import time
+import math
+import html
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-import yfinance as yf
+try:
+    import yfinance as yf
+except ModuleNotFoundError:
+    yf = None  # Allows offline unit tests without the network adapter installed.
 import requests
 
 VN_TZ = timezone(timedelta(hours=7))
@@ -99,32 +101,44 @@ SESSION_ALERT_WINDOW_MIN = 10  # bắt sự kiện trong vòng 10 phút sau gi�
 # --- Ping định kỳ (module 5) ---
 PING_HOURS_VN = [7]  # danh sách giờ VN sẽ gửi ping mỗi ngày, thêm số vào list nếu muốn nhiều lần/ngày
 
-# --- Hệ thống EMA34/89 riêng của bạn (module 6) ---
-# Luật: khung M15, xu hướng xác định bởi EMA34 vs EMA89. Với setup BUY: EMA34>EMA89
-# (uptrend); giá lao xuống chạm/cắt EMA89 (pullback sâu); rồi lao lên cắt lại CẢ HAI
-# đường EMA34 và EMA89 (xác nhận pullback kết thúc, xu hướng tiếp diễn); đồng thời
-# RSI khung H4 và D1 đều > 50 (xác nhận đà tăng lớn hơn). Setup SELL làm ngược lại.
+# --- Module switches: retain the other modules from the supplied script. ---
+def env_flag(name: str, default: bool = True) -> bool:
+    value = os.getenv(name, "1" if default else "0").strip().lower()
+    if value not in {"1", "0", "true", "false", "yes", "no"}:
+        raise ValueError(f"Invalid boolean setting {name}={value!r}")
+    return value in {"1", "true", "yes"}
+
+
+ENABLE_RSI_MODULE = env_flag("ENABLE_RSI_MODULE")
+ENABLE_CALENDAR_MODULE = env_flag("ENABLE_CALENDAR_MODULE")
+ENABLE_SESSION_MODULE = env_flag("ENABLE_SESSION_MODULE")
+ENABLE_PING_MODULE = env_flag("ENABLE_PING_MODULE")
+ENABLE_3489_BASE = env_flag("ENABLE_3489_BASE")
+ENABLE_3489_STRUCTURE = env_flag("ENABLE_3489_STRUCTURE")
+
+# --- Setup 3489: no additional confluence filters or trade planning. ---
 EMA_CROSS_TIMEFRAME = "15m"
 EMA_CROSS_FAST = 34
 EMA_CROSS_SLOW = 89
-EMA_CROSS_TOUCH_LOOKBACK = 20   # số nến M15 tìm ngược để tìm điểm chạm EMA89 trước khi bật lên/xuống lại
-EMA_CROSS_RSI_HTF_1 = "4h"      # khung lớn thứ nhất dùng lọc RSI (theo đúng yêu cầu: H4)
-EMA_CROSS_RSI_HTF_2 = "1D"      # khung lớn thứ hai dùng lọc RSI (theo đúng yêu cầu: D1)
+# Maximum number of M15 bars from the FIRST EMA89 touch to recovery.
+# Retains the original script's 20-bar horizon; this is configurable.
+EMA_CROSS_TOUCH_LOOKBACK = 20
 EMA_CROSS_RSI_THRESHOLD = 50
 
-# --- Bộ lọc hợp lưu bổ sung (khắc phục entry ngược hỗ trợ/kháng cự, đảm bảo R:R) ---
-SR_SWING_ORDER_NEAR = 4        # số nến mỗi bên để xác nhận đỉnh/đáy trên khung M15 (dùng đặt SL)
-SR_LOOKBACK_NEAR = 150         # số nến M15 gần nhất được xét để tìm đỉnh/đáy gần (SL)
-SR_SWING_ORDER_FAR = 5         # số nến mỗi bên để xác nhận đỉnh/đáy trên khung 4h (dùng lọc entry + đặt TP)
-SR_LOOKBACK_FAR = 180          # số nến 4h gần nhất được xét (~30 ngày) để tìm vùng hỗ trợ/kháng cự lớn
-SR_PROXIMITY_ATR_MULT = 0.5    # nếu giá cách 1 vùng hỗ trợ/kháng cự đối nghịch < 0.5 x ATR -> HUỶ tín hiệu
+# M5 swing definition: strictly greater/lower than two bars on each side.
+# A pivot is usable only AFTER its right-side bars have closed.
+STRUCTURE_SWING_LEFT = 2
+STRUCTURE_SWING_RIGHT = 2
+STRUCTURE_LOOKBACK_M5 = 240
+# Strict "simultaneous": M5 closing breakout must occur inside the SAME
+# M15 candle that completes 3489. Later M15 candles cannot upgrade this setup.
 
-SL_BUFFER_ATR_MULT = 0.2       # đệm thêm ngoài điểm chạm EMA89 khi đặt Stop Loss
-RR_TARGET_MIN = 2.0            # chỉ báo tín hiệu nếu R:R ước tính đạt tối thiểu 1:2
-
-# --- Xác nhận chéo giữa các mã tương quan ---
-CORRELATION_LOOKBACK_DAYS = 30  # số ngày gần nhất dùng để tính tương quan (dựa trên % thay đổi giá đóng cửa ngày)
-CORRELATION_THRESHOLD = 0.7     # |tương quan| >= ngưỡng này mới được coi là "tương quan mạnh"
+# Operational safeguards, NOT additional trading confluence filters.
+CANDLE_CLOSE_GRACE_SECONDS = 30
+MAX_SIGNAL_AGE_MINUTES = 30  # catch up recent bars, not an old historical flood
+SENT_STATE_RETENTION_DAYS = 7
+H4_ANCHOR_TIMEZONE = "UTC"   # synthetic H4: 00:00, 04:00, 08:00, ... UTC
+H4_ANCHOR_OFFSET_HOURS = 0
 
 
 # ============================================================================
@@ -132,24 +146,27 @@ CORRELATION_THRESHOLD = 0.7     # |tương quan| >= ngưỡng này mới đượ
 # ============================================================================
 
 def load_state():
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
+    if not os.path.exists(STATE_FILE):
+        return {}
+    with open(STATE_FILE, "r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not isinstance(data, dict):
+        raise ValueError("state.json must contain a JSON object")
+    return data
 
 
 def save_state(state):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2, default=str)
+    temporary = f"{STATE_FILE}.tmp.{os.getpid()}"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump(state, handle, ensure_ascii=False, indent=2, default=str, allow_nan=False)
+    os.replace(temporary, STATE_FILE)
 
 
-def send_telegram(text: str):
+def send_telegram(text: str) -> bool:
+    """True only after Telegram acknowledges success; never log the bot token."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[CẢNH BÁO] Thiếu TELEGRAM_TOKEN hoặc TELEGRAM_CHAT_ID -> không gửi được tin nhắn.")
-        return
+        print("[TELEGRAM] Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID; not sent.")
+        return False
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -158,13 +175,20 @@ def send_telegram(text: str):
         "disable_web_page_preview": True,
     }
     try:
-        r = requests.post(url, data=payload, timeout=15)
-        if r.status_code != 200:
-            print(f"[LỖI] Gửi Telegram thất bại: {r.status_code} {r.text}")
-    except Exception as e:
-        print(f"[LỖI] Gửi Telegram gặp ngoại lệ: {e}")
+        response = requests.post(url, data=payload, timeout=15)
+        body = response.json()
+        if not isinstance(body, dict):
+            raise ValueError("Invalid Telegram response")
+        if response.status_code == 200 and body.get("ok") is True:
+            return True
+        description = str(body.get("description", "Unknown error")).replace(TELEGRAM_TOKEN, "[REDACTED]")
+        print(f"[TELEGRAM] HTTP {response.status_code}: {description}")
+    except (requests.RequestException, ValueError) as exc:
+        # Exception text can contain the URL, including the secret token.
+        print(f"[TELEGRAM] Request failed ({type(exc).__name__}); will retry 3489 next run.")
     finally:
         time.sleep(TELEGRAM_DELAY_SEC)
+    return False
 
 
 def now_vn_str():
@@ -187,39 +211,98 @@ def calc_rsi(close: pd.Series, period: int = RSI_PERIOD) -> pd.Series:
     return rsi
 
 
-def fetch_ohlc(ticker: str, timeframe: str, period_override: str = None) -> pd.DataFrame:
-    """Lấy dữ liệu OHLC cho 1 khung thời gian. Khung 4h được tự tổng hợp từ dữ liệu 1h."""
-    if timeframe == "5m":
-        interval, period = "5m", "5d"
-    elif timeframe == "15m":
-        interval, period = "15m", "5d"
-    elif timeframe == "1h":
-        interval, period = "60m", "1mo"
-    elif timeframe == "4h":
-        interval, period = "60m", "3mo"
-    elif timeframe == "1D":
-        interval, period = "1d", "6mo"
-    else:
-        raise ValueError(f"Khung thời gian không hỗ trợ: {timeframe}")
+def as_utc(value=None) -> pd.Timestamp:
+    """Return a timezone-aware UTC timestamp; naive inputs mean UTC."""
+    stamp = pd.Timestamp.now(tz="UTC") if value is None else pd.Timestamp(value)
+    return stamp.tz_localize("UTC") if stamp.tzinfo is None else stamp.tz_convert("UTC")
 
-    if period_override:
-        period = period_override
 
-    df = yf.download(ticker, interval=interval, period=period, progress=False, auto_adjust=False)
+def normalize_ohlc(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+    """Normalize Yahoo bars and attach their conservative availability time.
 
+    Intraday BarClose is bar start + duration. D1 becomes available at the
+    next local midnight in the source index timezone, not the broker's session
+    close. H4 is explicitly resampled in H4_ANCHOR_TIMEZONE. The returned frame
+    can still contain a forming bar; only the new 3489 module removes it.
+    This preserves the original RSI module's use of the latest Yahoo value.
+    """
     if df is None or df.empty:
-        raise RuntimeError(f"Không có dữ liệu cho {ticker} khung {timeframe}")
+        raise RuntimeError("Empty OHLC data")
+    d = df.copy()
+    if isinstance(d.columns, pd.MultiIndex):
+        d.columns = d.columns.get_level_values(0)
+    required = ["Open", "High", "Low", "Close"]
+    if not all(col in d.columns for col in required):
+        raise RuntimeError("Missing OHLC columns")
+    d = d[required].apply(pd.to_numeric, errors="coerce")
+    d = d.replace([float("inf"), -float("inf")], float("nan")).dropna()
+    d.index = pd.DatetimeIndex(d.index)
+    if d.index.tz is None:
+        # ignore_tz=False normally supplies source timezone; log fallback.
+        print("  [DATA] Naive timestamps: assuming UTC; verify source timezone.")
+        d.index = d.index.tz_localize("UTC")
+    d = d[~d.index.duplicated(keep="last")].sort_index()
+    if d.empty:
+        raise RuntimeError("No valid OHLC rows")
+    if timeframe == "1D":
+        # DateOffset, not Timedelta(24h), preserves midnight across DST.
+        bar_close = d.index.normalize() + pd.DateOffset(days=1)
+        d["BarClose"] = bar_close.tz_convert("UTC")
+        d.index = d.index.tz_convert("UTC")
+    else:
+        if timeframe == "4h":
+            d.index = d.index.tz_convert(H4_ANCHOR_TIMEZONE)
+            d = d.resample(
+                "4h", closed="left", label="left", origin="start_day",
+                offset=pd.Timedelta(hours=H4_ANCHOR_OFFSET_HOURS),
+            ).agg({"Open": "first", "High": "max", "Low": "min", "Close": "last"}).dropna()
+        durations = {"5m": "5min", "15m": "15min", "1h": "1h", "4h": "4h"}
+        if timeframe not in durations:
+            raise ValueError(f"Unsupported timeframe: {timeframe}")
+        d.index = d.index.tz_convert("UTC")
+        d["BarClose"] = d.index + pd.Timedelta(durations[timeframe])
+    return d
 
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
 
-    if timeframe == "4h":
-        df = df.resample("4h").agg({
-            "Open": "first", "High": "max", "Low": "min",
-            "Close": "last", "Volume": "sum",
-        }).dropna()
+def closed_bars(df: pd.DataFrame, as_of) -> pd.DataFrame:
+    """BarClose must already be present; never silently guess D1 boundaries."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    if "BarClose" not in df.columns:
+        raise ValueError("Call normalize_ohlc before closed_bars")
+    cutoff = as_utc(as_of)
+    # A snapshot downloaded BEFORE a bar closed must not become a "closed"
+    # candle merely because scanning other instruments took several minutes.
+    fetched_at = df.attrs.get("fetched_at_utc")
+    if fetched_at is not None:
+        safe_snapshot = as_utc(fetched_at) - pd.Timedelta(seconds=CANDLE_CLOSE_GRACE_SECONDS)
+        cutoff = min(cutoff, safe_snapshot)
+    return df.loc[df["BarClose"] <= cutoff].copy()
 
-    return df[["Open", "High", "Low", "Close"]].dropna()
+
+def fetch_ohlc(ticker: str, timeframe: str, period_override: str = None) -> pd.DataFrame:
+    """Fetch raw bars with explicit timezone handling; H4 uses hourly data."""
+    if yf is None:
+        raise RuntimeError("Missing yfinance: run python -m pip install yfinance pandas requests")
+    settings = {
+        "5m": ("5m", "5d"),
+        "15m": ("15m", "1mo"),  # extra EMA warm-up, within intraday limits
+        "1h": ("60m", "1mo"),
+        "4h": ("60m", "1mo"),
+        "1D": ("1d", "6mo"),
+    }
+    if timeframe not in settings:
+        raise ValueError(f"Unsupported timeframe: {timeframe}")
+    interval, period = settings[timeframe]
+    fetched_at = as_utc()  # capture BEFORE request; conservative snapshot cutoff
+    df = yf.download(
+        ticker, interval=interval, period=period_override or period,
+        progress=False, auto_adjust=False, ignore_tz=False,
+        threads=False, timeout=20,
+    )
+    result = normalize_ohlc(df, timeframe)
+    result.attrs["fetched_at_utc"] = fetched_at.isoformat()
+    return result
 
 
 def fetch_close_series(ticker: str, timeframe: str) -> pd.Series:
@@ -245,9 +328,7 @@ def fetch_ohlc_with_retry(ticker: str, timeframe: str, period_override: str = No
 
 
 def fetch_ohlc_and_rsi_with_retry(ticker: str, timeframe: str):
-    """Trả về (df_ohlc, rsi_series, err). Giữ nguyên cả OHLC (không chỉ Close) để
-    có thể tái sử dụng High/Low cho việc tìm vùng hỗ trợ/kháng cự ở chỗ khác mà
-    không cần gọi thêm Yahoo Finance. Có thử lại khi lỗi tạm thời."""
+    """Return (OHLC, original RSI series, error) with retries; reuse prices."""
     last_err = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -331,265 +412,276 @@ def run_rsi_module(name, ticker, rsi_values, state, changed_flags):
 
 
 # ============================================================================
-# MODULE 6: HỆ THỐNG EMA34/89 RIÊNG (pullback chạm EMA89 rồi bật lại cả 2 đường)
+# MODULE: SETUP 3489 + SETUP 3489 / M5 STRUCTURE BREAK
 # ============================================================================
 
 def calc_ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
 
 
-def calc_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    high, low, close = df["High"], df["Low"], df["Close"]
-    prev_close = close.shift(1)
-    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
+def detect_3489_patterns(df_15m: pd.DataFrame) -> list:
+    """Chronological state machine on CLOSED M15 bars, without RSI yet.
 
+    BUY: maintain EMA34 > EMA89, first observe a close above both; then price
+    pulls through EMA34 and touches/passes EMA89; the FIRST close back above
+    both completes that pullback. SELL is the exact mirror. High/Low count
+    for touches, Close counts for recovery. A touch-and-recovery in one M15
+    bar is allowed if a favorable close was already observed before it.
 
-def get_trend_regime(close: pd.Series):
-    """Trả về 'up' / 'down' / 'none' dựa trên EMA34 vs EMA89 - dùng cho xác nhận chéo tương quan."""
-    if close.dropna().shape[0] < EMA_CROSS_SLOW + 1:
-        return None
-    ema_fast = calc_ema(close, EMA_CROSS_FAST)
-    ema_slow = calc_ema(close, EMA_CROSS_SLOW)
-    if pd.isna(ema_fast.iloc[-1]) or pd.isna(ema_slow.iloc[-1]):
-        return None
-    if ema_fast.iloc[-1] > ema_slow.iloc[-1]:
-        return "up"
-    if ema_fast.iloc[-1] < ema_slow.iloc[-1]:
-        return "down"
-    return "none"
-
-
-def find_swing_levels(df: pd.DataFrame, order: int, lookback: int):
-    """Trả về (danh sách giá đáy/support, danh sách giá đỉnh/resistance) đã xác nhận
-    trong `lookback` nến gần nhất, dùng High/Low thực của nến (không phải Close)."""
-    d = df.tail(lookback)
-    h, l = d["High"].values, d["Low"].values
-    n = len(d)
-    supports, resistances = [], []
-    for i in range(order, n - order):
-        window_h = h[i - order:i + order + 1]
-        window_l = l[i - order:i + order + 1]
-        if h[i] == window_h.max():
-            resistances.append(float(h[i]))
-        if l[i] == window_l.min():
-            supports.append(float(l[i]))
-    return sorted(set(supports)), sorted(set(resistances))
-
-
-def nearest_adverse_level(price: float, levels: list, atr: float, mult: float):
-    """Trả về mức giá gần nhất trong phạm vi atr*mult quanh price, hoặc None nếu không có."""
-    if not levels or atr is None or pd.isna(atr) or atr <= 0:
-        return None
-    threshold = atr * mult
-    nearby = [lvl for lvl in levels if abs(lvl - price) <= threshold]
-    if not nearby:
-        return None
-    return min(nearby, key=lambda lvl: abs(lvl - price))
-
-
-def nearest_target_level(price: float, levels: list, direction: str):
-    """direction='up': tìm mức gần nhất PHÍA TRÊN price (làm TP cho lệnh BUY).
-    direction='down': tìm mức gần nhất PHÍA DƯỚI price (làm TP cho lệnh SELL)."""
-    if direction == "up":
-        candidates = [lvl for lvl in levels if lvl > price]
-        return min(candidates) if candidates else None
-    candidates = [lvl for lvl in levels if lvl < price]
-    return max(candidates) if candidates else None
-
-
-def check_ema_cross_system(df_15m: pd.DataFrame, df_4h: pd.DataFrame, rsi_h4, rsi_d1):
-    """Trả về ('buy'|'sell'|None, info_dict) theo đúng luật bạn mô tả + 2 bộ lọc hợp lưu:
-      1. Xu hướng M15: EMA34 > EMA89 (tăng) hoặc EMA34 < EMA89 (giảm).
-      2. Giá lao xuống chạm/cắt EMA89 (pullback sâu) trong vài nến gần đây - với setup
-         BUY; ngược lại (lao lên chạm/cắt EMA89) với setup SELL.
-      3. Rồi giá bật lại, ĐÓNG CỬA vượt qua CẢ HAI đường EMA34 và EMA89 ở nến gần nhất
-         (và đây phải là lần đóng cửa VƯỢT ĐẦU TIÊN - tránh báo lại nhiều nến liền khi
-         giá đã ở trên/dưới cả 2 đường từ trước).
-      4. RSI khung H4 VÀ D1 đều cùng chiều (>50 cho BUY, <50 cho SELL) - đúng yêu cầu gốc.
-      5. (Bổ sung) Giá không được nằm sát 1 vùng hỗ trợ/kháng cự đối nghịch (0.5x ATR).
-      6. (Bổ sung) SL đặt ngay dưới/trên điểm chạm EMA89 (có đệm ATR), TP nhắm vào vùng
-         hỗ trợ/kháng cự đối diện gần nhất - chỉ báo nếu R:R ước tính >= RR_TARGET_MIN."""
-    close, high, low = df_15m["Close"], df_15m["High"], df_15m["Low"]
-    n = len(df_15m)
-    min_needed = EMA_CROSS_SLOW + EMA_CROSS_TOUCH_LOOKBACK + 5
-    if n < min_needed or rsi_h4 is None or rsi_d1 is None:
-        return None, None
-
-    ema_fast = calc_ema(close, EMA_CROSS_FAST)
-    ema_slow = calc_ema(close, EMA_CROSS_SLOW)
-    atr = calc_atr(df_15m, 14)
-
-    last, prev = n - 1, n - 2
-
-    def above_both(i):
-        return close.iloc[i] > ema_fast.iloc[i] and close.iloc[i] > ema_slow.iloc[i]
-
-    def below_both(i):
-        return close.iloc[i] < ema_fast.iloc[i] and close.iloc[i] < ema_slow.iloc[i]
-
-    trend_up = ema_fast.iloc[last] > ema_slow.iloc[last]
-    trend_down = ema_fast.iloc[last] < ema_slow.iloc[last]
-
-    setup = None
+    A regime flip, equality of EMAs, or >20 bars since first touch invalidates
+    the pending pullback. Recovery consumes it even when the later RSI gate
+    rejects the signal: the same touch can never be recycled.
+    """
+    if df_15m is None or len(df_15m) < EMA_CROSS_SLOW + 1:
+        return []
+    if EMA_CROSS_TOUCH_LOOKBACK < 1:
+        raise ValueError("EMA_CROSS_TOUCH_LOOKBACK must be positive")
+    fast = calc_ema(df_15m["Close"], EMA_CROSS_FAST).to_numpy()
+    slow = calc_ema(df_15m["Close"], EMA_CROSS_SLOW).to_numpy()
+    close = df_15m["Close"].to_numpy()
+    low = df_15m["Low"].to_numpy()
+    high = df_15m["High"].to_numpy()
+    times = df_15m.index
+    ends = df_15m["BarClose"]
+    events = []
+    regime = None
+    armed = False
     touch_idx = None
-
-    if trend_up and above_both(last) and not above_both(prev):
-        for i in range(prev, max(prev - EMA_CROSS_TOUCH_LOOKBACK, 0), -1):
-            if ema_fast.iloc[i] > ema_slow.iloc[i] and low.iloc[i] <= ema_slow.iloc[i]:
+    pullback_idx = None
+    for i in range(EMA_CROSS_SLOW - 1, len(df_15m)):
+        side = "buy" if fast[i] > slow[i] else "sell" if fast[i] < slow[i] else None
+        if side != regime or side is None:
+            regime, armed, touch_idx, pullback_idx = side, False, None, None
+        if side is None:
+            continue
+        favorable = close[i] > max(fast[i], slow[i]) if side == "buy" else close[i] < min(fast[i], slow[i])
+        crosses_fast = low[i] <= fast[i] if side == "buy" else high[i] >= fast[i]
+        touches_slow = low[i] <= slow[i] if side == "buy" else high[i] >= slow[i]
+        if touch_idx is not None and i - touch_idx > EMA_CROSS_TOUCH_LOOKBACK:
+            armed, touch_idx, pullback_idx = False, None, None
+        if armed:
+            if crosses_fast and pullback_idx is None:
+                pullback_idx = i
+            if touches_slow and touch_idx is None:
                 touch_idx = i
-                break
-        if touch_idx is not None and rsi_h4 > EMA_CROSS_RSI_THRESHOLD and rsi_d1 > EMA_CROSS_RSI_THRESHOLD:
-            setup = "buy"
+            if favorable and touch_idx is not None:
+                events.append({
+                    "side": side,
+                    "bar_start": times[i].isoformat(),
+                    "bar_close": as_utc(ends.iloc[i]).isoformat(),
+                    "pullback_start": times[pullback_idx if pullback_idx is not None else touch_idx].isoformat(),
+                    "touch_time": times[touch_idx].isoformat(),
+                    "touch_price": float(low[touch_idx] if side == "buy" else high[touch_idx]),
+                    "touch_bars_ago": i - touch_idx,
+                    "ema_fast": float(fast[i]),
+                    "ema_slow": float(slow[i]),
+                })
+        if favorable:
+            armed, touch_idx, pullback_idx = True, None, None
+    return events
 
-    elif trend_down and below_both(last) and not below_both(prev):
-        for i in range(prev, max(prev - EMA_CROSS_TOUCH_LOOKBACK, 0), -1):
-            if ema_fast.iloc[i] < ema_slow.iloc[i] and high.iloc[i] >= ema_slow.iloc[i]:
-                touch_idx = i
-                break
-        if touch_idx is not None and rsi_h4 < EMA_CROSS_RSI_THRESHOLD and rsi_d1 < EMA_CROSS_RSI_THRESHOLD:
-            setup = "sell"
 
-    if setup is None or pd.isna(atr.iloc[last]):
+def rsi_asof(frame: pd.DataFrame, moment):
+    """Return (RSI, RSI bar close time), using only data available at moment."""
+    d = closed_bars(frame, moment)
+    if d.empty or len(d) < RSI_PERIOD + 1:
         return None, None
-
-    entry = float(close.iloc[last])
-    current_atr = float(atr.iloc[last])
-
-    supports_near, resistances_near = find_swing_levels(df_15m, SR_SWING_ORDER_NEAR, SR_LOOKBACK_NEAR)
-    supports_far, resistances_far = [], []
-    if df_4h is not None and len(df_4h) >= SR_LOOKBACK_FAR:
-        supports_far, resistances_far = find_swing_levels(df_4h, SR_SWING_ORDER_FAR, SR_LOOKBACK_FAR)
-
-    if setup == "buy":
-        adverse = nearest_adverse_level(entry, resistances_near + resistances_far, current_atr, SR_PROXIMITY_ATR_MULT)
-        if adverse is not None:
-            return None, None
-
-        touch_price = float(low.iloc[touch_idx])
-        sl = touch_price - SL_BUFFER_ATR_MULT * current_atr
-        risk = entry - sl
-        if risk <= 0:
-            return None, None
-
-        target_level = nearest_target_level(entry, resistances_far + resistances_near, "up")
-        min_tp = entry + RR_TARGET_MIN * risk
-        tp = target_level if (target_level is not None and target_level >= min_tp) else min_tp
-        rr = (tp - entry) / risk
-
-    else:  # sell
-        adverse = nearest_adverse_level(entry, supports_near + supports_far, current_atr, SR_PROXIMITY_ATR_MULT)
-        if adverse is not None:
-            return None, None
-
-        touch_price = float(high.iloc[touch_idx])
-        sl = touch_price + SL_BUFFER_ATR_MULT * current_atr
-        risk = sl - entry
-        if risk <= 0:
-            return None, None
-
-        target_level = nearest_target_level(entry, supports_far + supports_near, "down")
-        min_tp = entry - RR_TARGET_MIN * risk
-        tp = target_level if (target_level is not None and target_level <= min_tp) else min_tp
-        rr = (entry - tp) / risk
-
-    if rr < RR_TARGET_MIN - 1e-9:
+    series = calc_rsi(d["Close"])
+    value = series.iloc[-1]
+    if pd.isna(value) or not math.isfinite(float(value)):
         return None, None
-
-    info = {
-        "entry": entry, "sl": float(sl), "tp": float(tp), "rr": float(rr),
-        "ema_fast": float(ema_fast.iloc[last]), "ema_slow": float(ema_slow.iloc[last]),
-        "touch_price": touch_price, "touch_bars_ago": last - touch_idx,
-        "rsi_h4": float(rsi_h4), "rsi_d1": float(rsi_d1),
-    }
-    return setup, info
+    return float(value), as_utc(d["BarClose"].iloc[-1]).isoformat()
 
 
-def format_ema_cross_alert(name: str, setup: str, info: dict, is_new: bool, correlation_note: str = None) -> str:
-    dots = "🟢🟢🟢" if setup == "buy" else "🔴🔴🔴"
-    label = "EMA34/89 - VÀO LỆNH BUY" if setup == "buy" else "EMA34/89 - VÀO LỆNH SELL"
-    trang_thai = "🆕 MỚI XUẤT HIỆN" if is_new else "🔁 ĐANG TIẾP DIỄN"
+def qualify_3489(event: dict, h4: pd.DataFrame, d1: pd.DataFrame):
+    """The only momentum filters: H4 and D1 RSI strictly above/below 50."""
+    r4, t4 = rsi_asof(h4, event["bar_close"])
+    rd, td = rsi_asof(d1, event["bar_close"])
+    if r4 is None or rd is None:
+        return None
+    threshold = EMA_CROSS_RSI_THRESHOLD
+    ok = r4 > threshold and rd > threshold if event["side"] == "buy" else r4 < threshold and rd < threshold
+    if not ok:
+        return None
+    return dict(event, rsi_h4=r4, rsi_d1=rd, rsi_h4_bar_close=t4, rsi_d1_bar_close=td)
 
+
+def check_structure_break(df_5m: pd.DataFrame, event: dict):
+    """First fresh closing break of the nearest active confirmed LH/HL.
+
+    A BUY candidate is the latest confirmed swing high only if it is lower
+    than the immediately preceding swing high. For SELL, use the latest low
+    only if higher than the preceding swing low. Equal levels are neither.
+    A newly confirmed non-LH/non-HL clears the prior candidate. Once a level
+    has been broken on a close, a later recross does not make it fresh again.
+
+    Pivot confirmation must PRECEDE the breakout candle. Detect each pivot
+    using only candles that had closed by then, avoiding future-bar leakage.
+    Require the breakout's M5 close in (M15 start, M15 close]. No pending
+    upgrade across later M15 candles. Missing M5 data affects only type 2.
+    """
+    if df_5m is None or df_5m.empty:
+        return None
+    start, end = as_utc(event["bar_start"]), as_utc(event["bar_close"])
+    d = closed_bars(df_5m, end).tail(STRUCTURE_LOOKBACK_M5)
+    # The three constituent M5 bars must be available. A data gap is not a
+    # negative signal; run_3489_module can retry type 2 during the catch-up window.
+    required = pd.date_range(start, periods=3, freq="5min")
+    if not required.isin(d.index).all():
+        return None
+    left, right = STRUCTURE_SWING_LEFT, STRUCTURE_SWING_RIGHT
+    if min(left, right) < 1:
+        raise ValueError("Swing left/right parameters must be positive")
+    buy = event["side"] == "buy"
+    values = d["High" if buy else "Low"].to_numpy()
+    closes = d["Close"].to_numpy()
+    ends = d["BarClose"]
+    previous_pivot = None
+    candidate = None
+    for j in range(1, len(d)):
+        # p+right == j-1: the right-hand confirmation bars closed BEFORE j.
+        p = j - right - 1
+        if p >= left:
+            window = values[p-left:p+right+1]
+            v = values[p]
+            unique = int((window == v).sum()) == 1
+            extremum = v == (window.max() if buy else window.min())
+            if unique and extremum:
+                is_structure = previous_pivot is not None and (
+                    v < previous_pivot if buy else v > previous_pivot
+                )
+                candidate = {
+                    "kind": "LH" if buy else "HL",
+                    "level": float(v),
+                    "previous_level": float(previous_pivot),
+                    "pivot_time": d.index[p].isoformat(),
+                    "confirmed_at": as_utc(ends.iloc[p+right]).isoformat(),
+                    "broken": False,
+                } if is_structure else None
+                previous_pivot = float(v)
+        if candidate is None or candidate["broken"]:
+            continue
+        level = candidate["level"]
+        crossed = closes[j-1] <= level < closes[j] if buy else closes[j-1] >= level > closes[j]
+        if not crossed:
+            continue
+        candidate["broken"] = True
+        breakout_time = as_utc(ends.iloc[j])
+        if start < breakout_time <= end:
+            return {
+                "kind": candidate["kind"], "level": level,
+                "previous_level": candidate["previous_level"],
+                "pivot_time": candidate["pivot_time"],
+                "confirmed_at": candidate["confirmed_at"],
+                "break_bar_start": d.index[j].isoformat(),
+                "break_bar_close": breakout_time.isoformat(),
+                "break_close": float(closes[j]),
+            }
+    return None
+
+
+def vn_timestamp(value) -> str:
+    return as_utc(value).tz_convert(VN_TZ).strftime("%d/%m/%Y %H:%M")
+
+
+def format_3489_alert(name: str, ticker: str, info: dict, structure=None) -> str:
+    """Two independent alert labels. No order suggestions or trade levels."""
+    side = info["side"].upper()
+    icon = "\U0001f7e2" if side == "BUY" else "\U0001f534"
+    relation = "&gt;" if side == "BUY" else "&lt;"
+    position = "tr\u00ean" if side == "BUY" else "d\u01b0\u1edbi"
+    number = 2 if structure else 1
+    title = "SETUP 3489" if structure is None else f"SETUP 3489 + PH\u00c1 {structure['kind']} M5"
     lines = [
-        f"{dots} <b>{name}</b> — {label} (khung {EMA_CROSS_TIMEFRAME})",
-        trang_thai,
-        f"Entry: {info['entry']:.5f}",
-        f"SL: {info['sl']:.5f}  |  TP: {info['tp']:.5f}  |  R:R ≈ 1:{info['rr']:.2f}",
-        f"EMA{EMA_CROSS_FAST}: {info['ema_fast']:.5f} | EMA{EMA_CROSS_SLOW}: {info['ema_slow']:.5f}",
-        f"Điểm chạm EMA{EMA_CROSS_SLOW} gần nhất: {info['touch_price']:.5f} ({info['touch_bars_ago']} nến M15 trước)",
-        f"RSI H4: {info['rsi_h4']:.1f} | RSI D1: {info['rsi_d1']:.1f}",
+        f"{icon} <b>T\u00cdN HI\u1ec6U {number} | {title} | {side}</b>",
+        f"<b>{html.escape(name)}</b> ({html.escape(ticker)})",
+        f"M15: EMA34 {relation} EMA89; gi\u00e1 \u0111\u00e3 ch\u1ea1m/c\u1eaft EMA89 v\u00e0 \u0111\u00f3ng c\u1eeda tr\u1edf l\u1ea1i {position} c\u1ea3 hai EMA.",
+        f"EMA34: {info['ema_fast']:.5f} | EMA89: {info['ema_slow']:.5f}",
+        f"RSI H4: {info['rsi_h4']:.2f} | RSI D1: {info['rsi_d1']:.2f}",
+        f"Ch\u1ea1m EMA89: n\u1ebfn M15 m\u1edf {vn_timestamp(info['touch_time'])}",
+        f"M15 x\u00e1c nh\u1eadn \u0111\u00f3ng: {vn_timestamp(info['bar_close'])}",
     ]
-
-    if correlation_note:
-        lines.append(correlation_note)
-
-    lines.append(f"🕒 {now_vn_str()} (giờ VN)")
+    if structure:
+        lines.extend([
+            f"{structure['kind']} M5: {structure['level']:.5f} (swing tr\u01b0\u1edbc: {structure['previous_level']:.5f})",
+            f"N\u1ebfn M5 ph\u00e1 \u0111\u00f3ng: {vn_timestamp(structure['break_bar_close'])}",
+            f"Close M5 ph\u00e1: {structure['break_close']:.5f}",
+        ])
+    lines.extend([
+        f"RSI H4/D1 d\u00f9ng n\u1ebfn \u0111\u00e3 \u0111\u00f3ng t\u1ea1i th\u1eddi \u0111i\u1ec3m M15 x\u00e1c nh\u1eadn.",
+        f"\U0001f552 G\u1eedi: {now_vn_str()} | To\u00e0n b\u1ed9 gi\u1edd VN (UTC+7)",
+    ])
     return "\n".join(lines)
 
 
-def run_ema_cross_module(name, ticker, df_15m, setup, info, correlation_note, state):
-    ema_state = state.setdefault("ema_cross", {}).setdefault(ticker, {})
-    bar_ts = df_15m.index[-1].isoformat()
-    key = f"{setup}_ts"
-    is_new = ema_state.get(key) != bar_ts
+def run_3489_module(name: str, ticker: str, frames: dict, state: dict,
+                    now=None, sender=None, checkpoint=None) -> dict:
+    """Replay recent closed patterns, qualify as-of, send each type once.
 
-    send_telegram(format_ema_cross_alert(name, setup, info, is_new, correlation_note))
-    print(f"  -> [EMA34/89] ĐÃ GỬI CẢNH BÁO ({setup.upper()}, {'MỚI' if is_new else 'TIẾP DIỄN'}, R:R 1:{info['rr']:.2f})")
-
-    ema_state[key] = bar_ts
-
-
-# ============================================================================
-# MODULE 6b: XÁC NHẬN CHÉO GIỮA CÁC MÃ TƯƠNG QUAN
-# ============================================================================
-
-def compute_correlation_matrix(daily_closes: dict):
-    """daily_closes: {ticker: pd.Series giá đóng cửa ngày}. Trả về ma trận tương quan
-    dựa trên % thay đổi giá đóng cửa ngày, hoặc None nếu không đủ dữ liệu."""
-    usable = {t: s for t, s in daily_closes.items() if s is not None and len(s) > 5}
-    if len(usable) < 2:
-        return None
-    df = pd.DataFrame(usable)
-    df = df.tail(CORRELATION_LOOKBACK_DAYS + 5)
-    returns = df.pct_change().dropna(how="all")
-    if returns.shape[0] < 5:
-        return None
-    return returns.corr()
-
-
-def get_correlation_note(ticker: str, setup: str, corr_matrix, trend_by_ticker: dict, name_by_ticker: dict):
-    """Trả về 1 dòng chú thích xác nhận chéo (hoặc None nếu không tính được)."""
-    if corr_matrix is None or ticker not in corr_matrix.columns:
-        return None
-
-    row = corr_matrix[ticker].drop(index=ticker, errors="ignore").dropna()
-    strong = row[row.abs() >= CORRELATION_THRESHOLD].sort_values(key=lambda s: -s.abs())
-    if strong.empty:
-        return "ℹ️ Không có cặp nào tương quan đủ mạnh để xác nhận chéo lúc này."
-
-    target_dir = "up" if setup == "buy" else "down"
-    confirms, conflicts = [], []
-
-    for other_ticker, corr_val in strong.items():
-        other_trend = trend_by_ticker.get(other_ticker)
-        if other_trend is None or other_trend == "none":
+    Retry unsent events only while they remain inside MAX_SIGNAL_AGE_MINUTES.
+    State keeps separate keys for base/structure, so a missing M5 response or
+    a failed base delivery does not suppress the other notification.
+    checkpoint is called after every acknowledged send (main saves locally).
+    An ambiguous network timeout can still duplicate a Telegram delivery;
+    Bot API sendMessage does not provide an application idempotency key.
+    """
+    now = as_utc(now)
+    cutoff = now - pd.Timedelta(seconds=CANDLE_CLOSE_GRACE_SECONDS)
+    oldest = now - pd.Timedelta(minutes=MAX_SIGNAL_AGE_MINUTES)
+    stats = {"base_sent": 0, "structure_sent": 0, "delivery_failed": 0}
+    if not (ENABLE_3489_BASE or ENABLE_3489_STRUCTURE):
+        return stats
+    if any(frames.get(tf) is None or frames[tf].empty for tf in ("15m", "4h", "1D")):
+        print("  [3489] Missing M15/H4/D1; skipped. M5 is NOT required for type 1.")
+        return stats
+    d15 = closed_bars(frames["15m"], cutoff)
+    events = detect_3489_patterns(d15)
+    storage = state.setdefault("setup_3489", {}).setdefault(ticker, {"sent": {}})
+    sent = storage.setdefault("sent", {})
+    retention = now - pd.Timedelta(days=SENT_STATE_RETENTION_DAYS)
+    for key, stamp in list(sent.items()):
+        try:
+            expired = as_utc(stamp) < retention
+        except (ValueError, TypeError):
+            expired = True
+        if expired:
+            del sent[key]
+    deliver = send_telegram if sender is None else sender
+    for event in events:
+        event_time = as_utc(event["bar_close"])
+        if event_time < oldest:
             continue
-        expected_dir = other_trend if corr_val > 0 else ("down" if other_trend == "up" else "up")
-        other_name = name_by_ticker.get(other_ticker, other_ticker)
-        tag = f"{other_name} ({corr_val:+.2f})"
-        if expected_dir == target_dir:
-            confirms.append(tag)
-        else:
-            conflicts.append(tag)
-
-    parts = []
-    if confirms:
-        parts.append("✅ Xác nhận chéo: " + ", ".join(confirms[:3]))
-    if conflicts:
-        parts.append("⚠️ Tương quan nhưng đang ngược chiều: " + ", ".join(conflicts[:3]))
-    if not parts:
-        return "ℹ️ Có mã tương quan mạnh nhưng chưa đủ dữ liệu xu hướng để xác nhận."
-    return "\n".join(parts)
+        info = qualify_3489(event, frames["4h"], frames["1D"])
+        if info is None:
+            continue
+        event_id = f"{event['side']}|{event['bar_close']}"
+        # Send the independent base branch BEFORE inspecting M5, so corrupt
+        # M5 data cannot suppress an otherwise valid type-1 notification.
+        for kind, enabled in (("base", ENABLE_3489_BASE), ("structure", ENABLE_3489_STRUCTURE)):
+            key = f"{kind}|{event_id}"
+            if not enabled or key in sent:
+                continue
+            detail = None
+            if kind == "structure":
+                try:
+                    detail = check_structure_break(frames.get("5m"), event)
+                except (ValueError, KeyError, TypeError, IndexError) as exc:
+                    print(f"  [3489] M5 processing unavailable ({type(exc).__name__}); type 1 unaffected.")
+                    continue
+                if detail is None:
+                    continue
+            if deliver(format_3489_alert(name, ticker, info, detail)):
+                sent[key] = now.isoformat()
+                stats[f"{kind}_sent"] += 1
+                if checkpoint is not None:
+                    checkpoint()
+                print(f"  [3489] Sent {kind} {event['side'].upper()} at {event['bar_close']}")
+            else:
+                stats["delivery_failed"] += 1
+    storage["last_check"] = now.isoformat()
+    if not any(stats.values()):
+        print("  [3489] No new eligible alerts (or already sent).")
+    return stats
 
 
 # ============================================================================
@@ -836,89 +928,59 @@ def run_ping_module(state):
 def main():
     state = load_state()
     changed_flags = {"changed": False}
-
-    daily_closes = {}      # ticker -> Series giá đóng cửa 1D (dùng tính tương quan)
-    trend_by_ticker = {}   # ticker -> 'up'/'down'/'none' theo EMA34/89 khung H1 (dùng xác nhận chéo)
-    name_by_ticker = {}
-    ema_cross_candidates = []  # (name, ticker, df_15m, setup, info) - chờ gửi sau khi có tương quan
-
-    # --- Pha 1: quét từng mã (RSI setup + thu thập dữ liệu cho hệ thống EMA34/89 & tương quan) ---
-    for name, ticker in SYMBOLS.items():
-        name_by_ticker[ticker] = name
-        print(f"\n=== Đang quét {name} ({ticker}) ===")
-        rsi_values = {}
-        error_tf = []
-        df_15m = None
-        df_4h = None
-        df_1h_for_trend = None
-
-        for tf in TIMEFRAMES:
-            df, rsi_series, err = fetch_ohlc_and_rsi_with_retry(ticker, tf)
-            if err:
-                error_tf.append(tf)
+    if yf is None:
+        raise SystemExit("Missing yfinance. Run: python -m pip install -r requirements_setup3489.txt")
+    # No cross-symbol phase: each instrument is now fully independent.
+    required_tfs = TIMEFRAMES if ENABLE_RSI_MODULE else ["15m", "4h", "1D"]
+    if ENABLE_3489_STRUCTURE and "5m" not in required_tfs:
+        required_tfs = ["5m"] + required_tfs
+    try:
+        for name, ticker in SYMBOLS.items():
+            print(f"\n=== Scanning {name} ({ticker}) ===")
+            rsi_values, frames, error_tf = {}, {}, []
+            for tf in required_tfs:
+                df, rsi_series, err = fetch_ohlc_and_rsi_with_retry(ticker, tf)
+                if err:
+                    error_tf.append(tf)
+                    continue
+                frames[tf] = df
+                latest = rsi_series.iloc[-1] if len(rsi_series) else float("nan")
+                if pd.isna(latest) or not math.isfinite(float(latest)):
+                    error_tf.append(tf)
+                else:
+                    rsi_values[tf] = float(latest)
+                    print(f"  {tf}: RSI = {float(latest):.2f}")
+            fail_state = state.setdefault("rsi_fail", {}).setdefault(ticker, {"fail_count": 0, "fail_notified": False})
+            if error_tf:
+                fail_state["fail_count"] += 1
+                print(f"  Missing/invalid data: {error_tf}; failed scans={fail_state['fail_count']}")
+                if fail_state["fail_count"] >= FAIL_ALERT_THRESHOLD and not fail_state["fail_notified"]:
+                    ok = send_telegram(
+                        f"\u26a0\ufe0f <b>{html.escape(name)}</b>: thi\u1ebfu d\u1eef li\u1ec7u "
+                        f"{', '.join(error_tf)} trong {fail_state['fail_count']} l\u1ea7n qu\u00e9t li\u00ean ti\u1ebfp."
+                    )
+                    if ok:
+                        fail_state["fail_notified"] = True
             else:
-                rsi_values[tf] = float(rsi_series.dropna().iloc[-1])
-                print(f"  {tf}: RSI = {rsi_values[tf]:.2f}")
-                if tf == "15m":
-                    df_15m = df
-                elif tf == "4h":
-                    df_4h = df
-                elif tf == "1h":
-                    df_1h_for_trend = df
-                elif tf == "1D":
-                    daily_closes[ticker] = df["Close"]
-
-        fail_state = state.setdefault("rsi_fail", {}).setdefault(ticker, {"fail_count": 0, "fail_notified": False})
-
-        if error_tf:
-            fail_state["fail_count"] += 1
-            print(f"  Thiếu dữ liệu khung: {error_tf} (fail_count={fail_state['fail_count']})")
-            if fail_state["fail_count"] >= FAIL_ALERT_THRESHOLD and not fail_state["fail_notified"]:
-                send_telegram(
-                    f"⚠️ <b>{name}</b>: không lấy được dữ liệu Yahoo Finance cho khung "
-                    f"{', '.join(error_tf)} trong hơn 1 giờ liên tục. Vui lòng kiểm tra lại mã "
-                    f"hoặc nguồn dữ liệu."
-                )
-                fail_state["fail_notified"] = True
-                changed_flags["changed"] = True
-            continue
-        else:
-            if fail_state["fail_count"] > 0 or fail_state["fail_notified"]:
-                fail_state["fail_count"] = 0
-                fail_state["fail_notified"] = False
-                changed_flags["changed"] = True
-
-        run_rsi_module(name, ticker, rsi_values, state, changed_flags)
-
-        if df_1h_for_trend is not None:
-            trend_by_ticker[ticker] = get_trend_regime(df_1h_for_trend["Close"])
-
-        setup, info = check_ema_cross_system(df_15m, df_4h, rsi_values.get("4h"), rsi_values.get("1D"))
-        if setup is not None:
-            ema_cross_candidates.append((name, ticker, df_15m, setup, info))
-            print(f"  -> [EMA34/89] Ứng viên tín hiệu {setup.upper()} (R:R ước tính 1:{info['rr']:.2f}) - chờ xác nhận chéo")
-        else:
-            print("  -> [EMA34/89] Chưa đủ điều kiện (hoặc bị lọc bởi hỗ trợ-kháng cự / R:R)")
-
-        changed_flags["changed"] = True  # last_check luôn đổi -> luôn lưu lại cho gọn
-
-    # --- Pha 2: tính tương quan giữa các mã rồi mới gửi cảnh báo EMA34/89 ---
-    corr_matrix = compute_correlation_matrix(daily_closes)
-    for name, ticker, df_15m, setup, info in ema_cross_candidates:
-        correlation_note = get_correlation_note(ticker, setup, corr_matrix, trend_by_ticker, name_by_ticker)
-        run_ema_cross_module(name, ticker, df_15m, setup, info, correlation_note, state)
-
-    # --- Module 3, 4, 5: chạy 1 lần cho toàn hệ thống (không theo từng mã) ---
-    run_calendar_module(state)
-    run_session_module(state)
-    run_ping_module(state)
-    changed_flags["changed"] = True
-
-    if changed_flags["changed"]:
+                fail_state.update(fail_count=0, fail_notified=False)
+            if ENABLE_RSI_MODULE and all(tf in rsi_values for tf in TIMEFRAMES):
+                run_rsi_module(name, ticker, rsi_values, state, changed_flags)
+            # A missing 5m/1h frame must never block the base 3489 branch.
+            try:
+                run_3489_module(name, ticker, frames, state, checkpoint=lambda: save_state(state))
+            except Exception as exc:
+                # Do not print untrusted exception URLs or lose other instruments.
+                print(f"  [3489] Processing failed: {type(exc).__name__}; retry next scan.")
+            save_state(state)
+        if ENABLE_CALENDAR_MODULE:
+            run_calendar_module(state)
+        if ENABLE_SESSION_MODULE:
+            run_session_module(state)
+        if ENABLE_PING_MODULE:
+            run_ping_module(state)
+    finally:
         save_state(state)
-        print("\nĐã lưu state.json")
-    else:
-        print("\nKhông có gì thay đổi -> không cần ghi lại state.json")
+        print("\nSaved state.json")
 
 
 if __name__ == "__main__":
